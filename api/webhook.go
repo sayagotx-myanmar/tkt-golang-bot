@@ -2,17 +2,31 @@ package handler
 
 import (
 	"bytes"
-	"database/sql" // NEW: Required for database operations
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"          // NEW: To log errors for debugging
+	"log"
 	"net/http"
 	"os"
 
-	_ "github.com/lib/pq" // NEW: The PostgreSQL driver we installed earlier
+	_ "github.com/lib/pq"
 )
 
-// Structs to parse Telegram's incoming JSON
+// ==========================================
+// 1. DATA MODELS (STRUCTS)
+// ==========================================
+
+// Struct for your Supabase Database
+type TKTQuestion struct {
+	ID            int
+	QuestionText  string
+	CorrectOption string
+	WrongOption1  string
+	WrongOption2  string
+	Explanation   string
+}
+
+// Structs for Telegram JSON Payload
 type Update struct {
 	Message *Message `json:"message"`
 }
@@ -24,27 +38,32 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-// NEW: Global variable to hold our database connection
+// Structs for Telegram Buttons
+type InlineKeyboardButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+type InlineKeyboardMarkup struct {
+	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+}
+
+// ==========================================
+// 2. DATABASE CONNECTION LOGIC
+// ==========================================
+
 var db *sql.DB
 
-// NEW: Function to connect to Supabase securely
 func initDB() {
-	// If it's already connected (from a previous warm run), do nothing
 	if db != nil {
 		return
 	}
-
-	// Grab the database URL from Vercel's environment variables
 	connStr := os.Getenv("DATABASE_URL")
-	
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
 		log.Printf("Error opening database structure: %v\n", err)
 		return
 	}
-
-	// Ping the database to confirm the connection is actually alive
 	if err = db.Ping(); err != nil {
 		log.Printf("Error pinging Supabase: %v\n", err)
 	} else {
@@ -52,12 +71,13 @@ func initDB() {
 	}
 }
 
-// Handler is the serverless entrypoint
+// ==========================================
+// 3. MAIN WEBHOOK HANDLER
+// ==========================================
+
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// NEW: Ensure the database is connected before doing anything else
 	initDB()
 
-	// Only accept POST requests from Telegram
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -69,27 +89,49 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If a message was received, process it
 	if update.Message != nil {
 		botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
 
+		// Default response
 		responseText := "I received your message and checked the database!"
+
+		// Handle specific commands
 		if update.Message.Text == "/start" {
 			responseText = "Welcome to the TKT Prep Bot, powered by Serverless Golang and Supabase! 🚀"
+		} else if update.Message.Text == "/test" {
+			
+            // FETCH QUESTION FROM DATABASE HERE
+			var q TKTQuestion
+			err := db.QueryRow(`
+				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
+				FROM questions 
+				WHERE id = $1`, 1).Scan(
+				&q.ID,
+				&q.QuestionText,
+				&q.CorrectOption,
+				&q.WrongOption1,
+				&q.WrongOption2,
+				&q.Explanation,
+			)
+
+			if err != nil {
+				responseText = "Database error: " + err.Error()
+			} else {
+				// Format the question as a simple text response to prove it works
+				responseText = fmt.Sprintf("📚 *Question 1:*\n%s\n\n✅ *Correct Answer:* %s", q.QuestionText, q.CorrectOption)
+			}
 		}
 
-		// Prepare the JSON payload to send back to Telegram
 		replyBody, _ := json.Marshal(map[string]interface{}{
-			"chat_id": update.Message.Chat.ID,
-			"text":    responseText,
+			"chat_id":    update.Message.Chat.ID,
+			"text":       responseText,
+			"parse_mode": "Markdown", // Allows us to use bold text in Telegram
 		})
 
-		// Send the POST request to Telegram's API
 		http.Post(apiURL, "application/json", bytes.NewBuffer(replyBody))
 	}
 
-	// Always return a 200 OK to prevent Telegram from retrying the message
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "ok")
 }
