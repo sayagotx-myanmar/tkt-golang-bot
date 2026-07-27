@@ -30,7 +30,7 @@ type TKTQuestion struct {
 
 type Update struct {
 	Message       *Message       `json:"message"`
-	CallbackQuery *CallbackQuery `json:"callback_query"` // NEW: Listens for button clicks
+	CallbackQuery *CallbackQuery `json:"callback_query"`
 }
 
 type Message struct {
@@ -42,7 +42,6 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-// NEW: Struct to handle the data when a button is pressed
 type CallbackQuery struct {
 	ID      string   `json:"id"`
 	Message *Message `json:"message"`
@@ -72,7 +71,7 @@ func initDB() {
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		log.Printf("Error opening database structure: %v\n", err)
+		log.Printf("Error opening database: %v\n", err)
 		return
 	}
 	if err = db.Ping(); err != nil {
@@ -107,27 +106,78 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// SCENARIO A: THE USER CLICKED A BUTTON
 	// ==========================================
 	if update.CallbackQuery != nil {
-		// 1. Tell Telegram we received the click (stops the loading spinner on the button)
+		// Tell Telegram we received the click (stops the loading animation)
 		http.Post(apiURL+"answerCallbackQuery", "application/json", bytes.NewBuffer([]byte(fmt.Sprintf(`{"callback_query_id": "%s"}`, update.CallbackQuery.ID))))
 
-		// 2. Parse the hidden data we attached to the button (e.g., "ans:correct:1")
 		dataParts := strings.Split(update.CallbackQuery.Data, ":")
-		if len(dataParts) == 3 && dataParts[0] == "ans" 
-			{
+		
+		// EVENT 1: User chose a category (or clicked "Next Question")
+		if dataParts[0] == "cat" && len(dataParts) == 2 {
+			category := dataParts[1]
+			
+			// Fetch a random question FROM THIS SPECIFIC CATEGORY
+			var q TKTQuestion
+			err := db.QueryRow(`
+				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
+				FROM questions 
+				WHERE category = $1 
+				ORDER BY RANDOM() 
+				LIMIT 1`, category).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+
+			var responseText string
+			var replyMarkup interface{} = nil
+
+			if err != nil {
+				responseText = "No questions found for this category yet!"
+			} else {
+				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s", category, q.QuestionText)
+
+				type Option struct {
+					Text string
+					Data string
+				}
+				
+				// We attach the category string to the answer data so we can remember it!
+				options := []Option{
+					{Text: q.CorrectOption, Data: fmt.Sprintf("ans:correct:%d:%s", q.ID, category)},
+					{Text: q.WrongOption1, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
+					{Text: q.WrongOption2, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
+				}
+
+				randSource := rand.NewSource(time.Now().UnixNano())
+				rander := rand.New(randSource)
+				rander.Shuffle(len(options), func(i, j int) {
+					options[i], options[j] = options[j], options[i]
+				})
+
+				var keyboard [][]InlineKeyboardButton
+				for _, opt := range options {
+					keyboard = append(keyboard, []InlineKeyboardButton{{Text: opt.Text, CallbackData: opt.Data}})
+				}
+				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
+			}
+
+			payload := map[string]interface{}{
+				"chat_id":    update.CallbackQuery.Message.Chat.ID,
+				"text":       responseText,
+				"parse_mode": "Markdown",
+			}
+			if replyMarkup != nil {
+				payload["reply_markup"] = replyMarkup
+			}
+			
+			replyBody, _ := json.Marshal(payload)
+			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+
+		// EVENT 2: User clicked an answer
+		} else if dataParts[0] == "ans" && len(dataParts) == 4 {
 			status := dataParts[1]
 			questionID := dataParts[2]
-			} else if update.CallbackQuery.Data == "cmd:next"
-			{
-			// Trigger the same logic as typing /test
-			update.Message = update.CallbackQuery.Message
-			update.Message.Text = "/test"
-			// The code will naturally flow into Scenario B
-			}
-			// 3. Fetch the explanation for this specific question from Supabase
+			category := dataParts[3]
+
 			var explanation string
 			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
 
-			// 4. Formulate the response based on whether they were right or wrong
 			var responseText string
 			if status == "correct" {
 				responseText = "✅ *Correct!*\n\n"
@@ -136,71 +186,67 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 			responseText += "*Explanation:*\n" + explanation
 
-			// 5. Build a "Next Question" button
+			// Notice we pass the category back into the Next Question button
 			nextKeyboard := InlineKeyboardMarkup{
 				InlineKeyboard: [][]InlineKeyboardButton{
-					{{Text: "Next Question ➡️", CallbackData: "cmd:next"}},
+					{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
+					{{Text: "Change Topic 🔄", CallbackData: "cmd:categories"}},
 				},
 			}
 
-			// 6. Send the feedback message back to the candidate
 			replyBody, _ := json.Marshal(map[string]interface{}{
 				"chat_id":      update.CallbackQuery.Message.Chat.ID,
 				"text":         responseText,
 				"parse_mode":   "Markdown",
 				"reply_markup": nextKeyboard,
 			})
-	} else if update.Message != nil {
-		// ==========================================
-		// SCENARIO B: THE USER TYPED A MESSAGE
-		// ==========================================
-		responseText := "I received your message! Type /test to try a question."
-		var replyMarkup interface{} = nil // Optional keyboard
+			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+			
+		// EVENT 3: User clicked "Change Topic"
+		} else if dataParts[0] == "cmd" && dataParts[1] == "categories" {
+			// Trick the code into thinking the user typed /test to show the menu again
+			update.Message = update.CallbackQuery.Message
+			update.Message.Text = "/test"
+		}
+	} 
+	
+	// ==========================================
+	// SCENARIO B: THE USER TYPED A MESSAGE
+	// ==========================================
+	if update.Message != nil {
+		responseText := "I received your message! Type /test to practice."
+		var replyMarkup interface{} = nil
 
 		if update.Message.Text == "/start" {
-			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to practice a question."
+			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to start practicing."
 		} else if update.Message.Text == "/test" {
-
-		var q TKTQuestion
-			err := db.QueryRow(`
-				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
-				FROM questions 
-				ORDER BY RANDOM() 
-				LIMIT 1`).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
-
+			
+			// Dynamically find all unique categories in your database
+			rows, err := db.Query("SELECT DISTINCT category FROM questions WHERE category IS NOT NULL AND category != ''")
+			
 			if err != nil {
-				responseText = "Database error: " + err.Error()
+				responseText = "Error fetching categories: " + err.Error()
 			} else {
-				responseText = fmt.Sprintf("📚 *Question:*\n%s", q.QuestionText)
-
-				// 1. Group the answers and attach secret data to them
-				type Option struct {
-					Text string
-					Data string
-				}
-				options := []Option{
-					{Text: q.CorrectOption, Data: fmt.Sprintf("ans:correct:%d", q.ID)},
-					{Text: q.WrongOption1, Data: fmt.Sprintf("ans:wrong:%d", q.ID)},
-					{Text: q.WrongOption2, Data: fmt.Sprintf("ans:wrong:%d", q.ID)},
-				}
-
-				// 2. Shuffle the answers randomly
-				randSource := rand.NewSource(time.Now().UnixNano())
-				rander := rand.New(randSource)
-				rander.Shuffle(len(options), func(i, j int) {
-					options[i], options[j] = options[j], options[i]
-				})
-
-				// 3. Build the clickable keyboard layout (one button per row)
+				defer rows.Close()
+				responseText = "📂 *Choose a topic to practice:*"
 				var keyboard [][]InlineKeyboardButton
-				for _, opt := range options {
-					keyboard = append(keyboard, []InlineKeyboardButton{{Text: opt.Text, CallbackData: opt.Data}})
+				
+				for rows.Next() {
+					var cat string
+					if err := rows.Scan(&cat); err == nil {
+						// Create a button for every unique category found
+						keyboard = append(keyboard, []InlineKeyboardButton{{Text: cat, CallbackData: "cat:" + cat}})
+					}
 				}
-				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
+				
+				if len(keyboard) > 0 {
+					replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
+				} else {
+					responseText = "No categories found. Please add some in your Supabase table!"
+				}
 			}
 		}
 
-		// Send the message (with or without buttons depending on the command)
 		payload := map[string]interface{}{
 			"chat_id":    update.Message.Chat.ID,
 			"text":       responseText,
