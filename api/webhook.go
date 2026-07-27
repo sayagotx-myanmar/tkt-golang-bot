@@ -115,7 +115,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		if dataParts[0] == "cat" && len(dataParts) == 2 {
 			category := dataParts[1]
 			
-			// Fetch a random question FROM THIS SPECIFIC CATEGORY
 			var q TKTQuestion
 			err := db.QueryRow(`
 				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
@@ -137,7 +136,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					Data string
 				}
 				
-				// We attach the category string to the answer data so we can remember it!
 				options := []Option{
 					{Text: q.CorrectOption, Data: fmt.Sprintf("ans:correct:%d:%s", q.ID, category)},
 					{Text: q.WrongOption1, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
@@ -179,19 +177,26 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
 
 			var responseText string
-			if status == "correct" {
-				responseText = "✅ *Correct!*\n\n"
-			} else {
-				responseText = "❌ *Incorrect!*\n\n"
-			}
-			responseText += "*Explanation:*\n" + explanation
+			var nextKeyboard InlineKeyboardMarkup
 
-			// Notice we pass the category back into the Next Question button
-			nextKeyboard := InlineKeyboardMarkup{
-				InlineKeyboard: [][]InlineKeyboardButton{
-					{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
-					{{Text: "Change Topic 🔄", CallbackData: "cmd:categories"}},
-				},
+			// Split the logic for correct vs incorrect answers
+			if status == "correct" {
+				responseText = "✅ *Correct!*\n\n*Explanation:*\n" + explanation
+				nextKeyboard = InlineKeyboardMarkup{
+					InlineKeyboard: [][]InlineKeyboardButton{
+						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
+						{{Text: "Change Topic 🔄", CallbackData: "cmd:categories"}},
+					},
+				}
+			} else {
+				responseText = "❌ *Incorrect!*\n\n*Explanation:*\n" + explanation
+				nextKeyboard = InlineKeyboardMarkup{
+					InlineKeyboard: [][]InlineKeyboardButton{
+						// Give them a button to retry this specific question
+						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
+						{{Text: "Change Topic 🔄", CallbackData: "cmd:categories"}},
+					},
+				}
 			}
 
 			replyBody, _ := json.Marshal(map[string]interface{}{
@@ -202,9 +207,69 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			})
 			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 			
-		// EVENT 3: User clicked "Change Topic"
+		// EVENT 3: User clicked "Try Again"
+		} else if dataParts[0] == "retry" && len(dataParts) == 3 {
+			questionID := dataParts[1]
+			category := dataParts[2]
+
+			// Fetch the EXACT same question using the ID
+			var q TKTQuestion
+			err := db.QueryRow(`
+				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
+				FROM questions 
+				WHERE id = $1`, questionID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+
+			var responseText string
+			var replyMarkup interface{} = nil
+
+			if err != nil {
+				responseText = "Error fetching question. Let's try a new one."
+				replyMarkup = InlineKeyboardMarkup{
+					InlineKeyboard: [][]InlineKeyboardButton{
+						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
+					},
+				}
+			} else {
+				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s", category, q.QuestionText)
+
+				type Option struct {
+					Text string
+					Data string
+				}
+				
+				options := []Option{
+					{Text: q.CorrectOption, Data: fmt.Sprintf("ans:correct:%d:%s", q.ID, category)},
+					{Text: q.WrongOption1, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
+					{Text: q.WrongOption2, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
+				}
+
+				randSource := rand.NewSource(time.Now().UnixNano())
+				rander := rand.New(randSource)
+				rander.Shuffle(len(options), func(i, j int) {
+					options[i], options[j] = options[j], options[i]
+				})
+
+				var keyboard [][]InlineKeyboardButton
+				for _, opt := range options {
+					keyboard = append(keyboard, []InlineKeyboardButton{{Text: opt.Text, CallbackData: opt.Data}})
+				}
+				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
+			}
+
+			payload := map[string]interface{}{
+				"chat_id":    update.CallbackQuery.Message.Chat.ID,
+				"text":       responseText,
+				"parse_mode": "Markdown",
+			}
+			if replyMarkup != nil {
+				payload["reply_markup"] = replyMarkup
+			}
+			
+			replyBody, _ := json.Marshal(payload)
+			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+
+		// EVENT 4: User clicked "Change Topic"
 		} else if dataParts[0] == "cmd" && dataParts[1] == "categories" {
-			// Trick the code into thinking the user typed /test to show the menu again
 			update.Message = update.CallbackQuery.Message
 			update.Message.Text = "/test"
 		}
@@ -221,7 +286,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to start practicing."
 		} else if update.Message.Text == "/test" {
 			
-			// Dynamically find all unique categories in your database
 			rows, err := db.Query("SELECT DISTINCT category FROM questions WHERE category IS NOT NULL AND category != ''")
 			
 			if err != nil {
@@ -234,7 +298,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				for rows.Next() {
 					var cat string
 					if err := rows.Scan(&cat); err == nil {
-						// Create a button for every unique category found
 						keyboard = append(keyboard, []InlineKeyboardButton{{Text: cat, CallbackData: "cat:" + cat}})
 					}
 				}
