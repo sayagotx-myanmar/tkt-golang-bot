@@ -179,22 +179,20 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			var responseText string
 			var nextKeyboard InlineKeyboardMarkup
 
-			// Split the logic for correct vs incorrect answers
 			if status == "correct" {
 				responseText = "✅ *Correct!*\n\n*Explanation:*\n" + explanation
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
-						{{Text: "Change Topic 🔄", CallbackData: "cmd:categories"}},
+						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
 					},
 				}
 			} else {
 				responseText = "❌ *Incorrect!*\n\n*Explanation:*\n" + explanation
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
-						// Give them a button to retry this specific question
 						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
-						{{Text: "Change Topic 🔄", CallbackData: "cmd:categories"}},
+						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
 					},
 				}
 			}
@@ -212,7 +210,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			questionID := dataParts[1]
 			category := dataParts[2]
 
-			// Fetch the EXACT same question using the ID
 			var q TKTQuestion
 			err := db.QueryRow(`
 				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
@@ -268,7 +265,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			replyBody, _ := json.Marshal(payload)
 			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 
-		// EVENT 4: User clicked "Change Topic"
+		// EVENT 4: User clicked "Practice different module"
 		} else if dataParts[0] == "cmd" && dataParts[1] == "categories" {
 			update.Message = update.CallbackQuery.Message
 			update.Message.Text = "/test"
@@ -292,7 +289,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				responseText = "Error fetching categories: " + err.Error()
 			} else {
 				defer rows.Close()
-				responseText = "📂 *Choose a topic to practice:*"
+				responseText = "📂 *Choose a module to practice:*"
 				var keyboard [][]InlineKeyboardButton
 				
 				for rows.Next() {
