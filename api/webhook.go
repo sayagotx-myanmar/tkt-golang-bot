@@ -112,10 +112,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 		// 2. Parse the hidden data we attached to the button (e.g., "ans:correct:1")
 		dataParts := strings.Split(update.CallbackQuery.Data, ":")
-		if len(dataParts) == 3 && dataParts[0] == "ans" {
+		if len(dataParts) == 3 && dataParts[0] == "ans" 
+			{
 			status := dataParts[1]
 			questionID := dataParts[2]
-
+			} else if update.CallbackQuery.Data == "cmd:next"
+			{
+			// Trigger the same logic as typing /test
+			update.Message = update.CallbackQuery.Message
+			update.Message.Text = "/test"
+			// The code will naturally flow into Scenario B
+			}
 			// 3. Fetch the explanation for this specific question from Supabase
 			var explanation string
 			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
@@ -129,14 +136,20 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 			responseText += "*Explanation:*\n" + explanation
 
-			// 5. Send the feedback message back to the candidate
+			// 5. Build a "Next Question" button
+			nextKeyboard := InlineKeyboardMarkup{
+				InlineKeyboard: [][]InlineKeyboardButton{
+					{{Text: "Next Question ➡️", CallbackData: "cmd:next"}},
+				},
+			}
+
+			// 6. Send the feedback message back to the candidate
 			replyBody, _ := json.Marshal(map[string]interface{}{
-				"chat_id":    update.CallbackQuery.Message.Chat.ID,
-				"text":       responseText,
-				"parse_mode": "Markdown",
+				"chat_id":      update.CallbackQuery.Message.Chat.ID,
+				"text":         responseText,
+				"parse_mode":   "Markdown",
+				"reply_markup": nextKeyboard,
 			})
-			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
-		}
 	} else if update.Message != nil {
 		// ==========================================
 		// SCENARIO B: THE USER TYPED A MESSAGE
@@ -148,11 +161,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to practice a question."
 		} else if update.Message.Text == "/test" {
 
-			var q TKTQuestion
+		var q TKTQuestion
 			err := db.QueryRow(`
 				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
 				FROM questions 
-				WHERE id = $1`, 1).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+				ORDER BY RANDOM() 
+				LIMIT 1`).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
 
 			if err != nil {
 				responseText = "Database error: " + err.Error()
