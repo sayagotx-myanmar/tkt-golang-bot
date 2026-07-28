@@ -145,11 +145,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					options[i], options[j] = options[j], options[i]
 				})
 
-				// Format the question and options into the message body
 				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
 					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
 
-				// Create the A, B, C inline buttons in a single row
+				// Notice we use "ans" prefix for first-try answers
 				keyboard := [][]InlineKeyboardButton{
 					{
 						{Text: "A", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[0].Status, q.ID, category)},
@@ -172,11 +171,26 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			replyBody, _ := json.Marshal(payload)
 			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 
-		// EVENT 2: User clicked an answer
+		// EVENT 2: User clicked a FIRST-TRY answer
 		} else if dataParts[0] == "ans" && len(dataParts) == 4 {
 			status := dataParts[1]
 			questionID := dataParts[2]
 			category := dataParts[3]
+			userID := update.CallbackQuery.Message.Chat.ID
+
+			// Update database score (Upsert logic)
+			pointsToAdd := 0
+			if status == "correct" {
+				pointsToAdd = 1
+			}
+			db.Exec(`
+				INSERT INTO user_progress (telegram_user_id, category, points, attempts)
+				VALUES ($1, $2, $3, 1)
+				ON CONFLICT (telegram_user_id, category) 
+				DO UPDATE SET 
+					points = user_progress.points + EXCLUDED.points,
+					attempts = user_progress.attempts + EXCLUDED.attempts`,
+				userID, category, pointsToAdd)
 
 			var explanation string
 			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
@@ -203,14 +217,53 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			replyBody, _ := json.Marshal(map[string]interface{}{
-				"chat_id":      update.CallbackQuery.Message.Chat.ID,
+				"chat_id":      userID,
+				"text":         responseText,
+				"parse_mode":   "Markdown",
+				"reply_markup": nextKeyboard,
+			})
+			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+
+		// EVENT 3: User clicked an answer AFTER hitting Try Again (Does NOT count toward score/attempts)
+		} else if dataParts[0] == "retryans" && len(dataParts) == 4 {
+			status := dataParts[1]
+			questionID := dataParts[2]
+			category := dataParts[3]
+			userID := update.CallbackQuery.Message.Chat.ID
+
+			var explanation string
+			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
+
+			var responseText string
+			var nextKeyboard InlineKeyboardMarkup
+
+			if status == "correct" {
+				responseText = "✅ *Correct!*\n\n*Explanation:*\n" + explanation
+				nextKeyboard = InlineKeyboardMarkup{
+					InlineKeyboard: [][]InlineKeyboardButton{
+						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
+						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
+					},
+				}
+			} else {
+				responseText = "❌ *Incorrect!*\n\n*Explanation:*\n" + explanation
+				nextKeyboard = InlineKeyboardMarkup{
+					InlineKeyboard: [][]InlineKeyboardButton{
+						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
+						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
+					},
+				}
+			}
+
+			replyBody, _ := json.Marshal(map[string]interface{}{
+				"chat_id":      userID,
 				"text":         responseText,
 				"parse_mode":   "Markdown",
 				"reply_markup": nextKeyboard,
 			})
 			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 			
-		// EVENT 3: User clicked "Try Again"
+		// EVENT 4: User clicked "Try Again" (Uses retryans prefix so score isn't duplicated)
 		} else if dataParts[0] == "retry" && len(dataParts) == 3 {
 			questionID := dataParts[1]
 			category := dataParts[2]
@@ -249,16 +302,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					options[i], options[j] = options[j], options[i]
 				})
 
-				// Format the question and options into the message body for the retry as well
 				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
 					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
 
-				// Create the A, B, C inline buttons in a single row
 				keyboard := [][]InlineKeyboardButton{
 					{
-						{Text: "A", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[0].Status, q.ID, category)},
-						{Text: "B", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[1].Status, q.ID, category)},
-						{Text: "C", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[2].Status, q.ID, category)},
+						{Text: "A", CallbackData: fmt.Sprintf("retryans:%s:%d:%s", options[0].Status, q.ID, category)},
+						{Text: "B", CallbackData: fmt.Sprintf("retryans:%s:%d:%s", options[1].Status, q.ID, category)},
+						{Text: "C", CallbackData: fmt.Sprintf("retryans:%s:%d:%s", options[2].Status, q.ID, category)},
 					},
 				}
 				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
@@ -276,10 +327,21 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			replyBody, _ := json.Marshal(payload)
 			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 
-		// EVENT 4: User clicked "Practice different module"
+		// EVENT 5: User clicked "Practice different module"
 		} else if dataParts[0] == "cmd" && dataParts[1] == "categories" {
 			update.Message = update.CallbackQuery.Message
 			update.Message.Text = "/test"
+
+		// EVENT 6: User clicked "Reset Module"
+		} else if dataParts[0] == "reset" && len(dataParts) == 2 {
+			categoryToReset := dataParts[1]
+			userID := update.CallbackQuery.Message.Chat.ID
+
+			db.Exec("UPDATE user_progress SET points = 0, attempts = 0 WHERE telegram_user_id = $1 AND category = $2", userID, categoryToReset)
+
+			// Confirm reset and show progress again
+			update.Message = update.CallbackQuery.Message
+			update.Message.Text = "/progress"
 		}
 	} 
 	
@@ -291,7 +353,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		var replyMarkup interface{} = nil
 
 		if update.Message.Text == "/start" {
-			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to start practicing."
+			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to start practicing.\nType /progress to check your scores."
 		} else if update.Message.Text == "/test" {
 			
 			rows, err := db.Query("SELECT DISTINCT category FROM questions WHERE category IS NOT NULL AND category != ''")
@@ -314,6 +376,40 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 				} else {
 					responseText = "No categories found. Please add some in your Supabase table!"
+				}
+			}
+		} else if update.Message.Text == "/progress" {
+			userID := update.Message.Chat.ID
+			rows, err := db.Query("SELECT category, points, attempts FROM user_progress WHERE telegram_user_id = $1", userID)
+
+			if err != nil {
+				responseText = "Error fetching your progress."
+			} else {
+				defer rows.Close()
+				responseText = "📊 *Your Learning Progress:*\n\n"
+				var keyboard [][]InlineKeyboardButton
+				hasData := false
+
+				for rows.Next() {
+					var cat string
+					var pts, att int
+					if err := rows.Scan(&cat, &pts, &att); err == nil {
+						hasData = true
+						percentage := 0
+						if att > 0 {
+							percentage = (pts * 100) / att
+						}
+						responseText += fmt.Sprintf("🔹 *%s*\nScore: %d / %d (%d%%)\n\n", cat, pts, att, percentage)
+						
+						// Add a reset button for each module
+						keyboard = append(keyboard, []InlineKeyboardButton{{Text: fmt.Sprintf("🔄 Reset %s", cat), CallbackData: "reset:" + cat}})
+					}
+				}
+
+				if !hasData {
+					responseText = "📊 *Your Learning Progress:*\n\nYou haven't completed any practice questions yet! Type /test to begin."
+				} else {
+					replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 				}
 			}
 		}
