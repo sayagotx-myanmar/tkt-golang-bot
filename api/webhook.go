@@ -109,24 +109,30 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Post(apiURL+"answerCallbackQuery", "application/json", bytes.NewBuffer([]byte(fmt.Sprintf(`{"callback_query_id": "%s"}`, update.CallbackQuery.ID))))
 
 		dataParts := strings.Split(update.CallbackQuery.Data, ":")
+		userID := update.CallbackQuery.Message.Chat.ID
 		
 		// EVENT 1: User chose a category (or clicked "Next Question")
 		if dataParts[0] == "cat" && len(dataParts) == 2 {
 			category := dataParts[1]
 			
 			var q TKTQuestion
+			// NEW LOGIC: Only select questions that are NOT in the answered_questions table for this user
 			err := db.QueryRow(`
 				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
 				FROM questions 
 				WHERE category = $1 
+				AND id NOT IN (SELECT question_id FROM answered_questions WHERE telegram_user_id = $2)
 				ORDER BY RANDOM() 
-				LIMIT 1`, category).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+				LIMIT 1`, category, userID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
 
 			var responseText string
 			var replyMarkup interface{} = nil
 
-			if err != nil {
-				responseText = "No questions found for this category yet!"
+			if err == sql.ErrNoRows {
+				// They have answered everything!
+				responseText = fmt.Sprintf("🎉 *Congratulations!*\n\nYou have completed all the practice questions for *%s*.\n\nType /progress to see your final score, or reset the module to try again.", category)
+			} else if err != nil {
+				responseText = "Error fetching question. Please try again."
 			} else {
 				type Option struct {
 					Text   string
@@ -148,7 +154,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
 					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
 
-				// Notice we use "ans" prefix for first-try answers
 				keyboard := [][]InlineKeyboardButton{
 					{
 						{Text: "A", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[0].Status, q.ID, category)},
@@ -160,7 +165,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			payload := map[string]interface{}{
-				"chat_id":    update.CallbackQuery.Message.Chat.ID,
+				"chat_id":    userID,
 				"text":       responseText,
 				"parse_mode": "Markdown",
 			}
@@ -176,9 +181,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			status := dataParts[1]
 			questionID := dataParts[2]
 			category := dataParts[3]
-			userID := update.CallbackQuery.Message.Chat.ID
 
-			// Update database score (Upsert logic)
+			// 1. Update database score (Upsert logic)
 			pointsToAdd := 0
 			if status == "correct" {
 				pointsToAdd = 1
@@ -191,6 +195,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					points = user_progress.points + EXCLUDED.points,
 					attempts = user_progress.attempts + EXCLUDED.attempts`,
 				userID, category, pointsToAdd)
+
+			// 2. NEW LOGIC: Mark this specific question as answered so it doesn't repeat
+			db.Exec(`
+				INSERT INTO answered_questions (telegram_user_id, question_id) 
+				VALUES ($1, $2) 
+				ON CONFLICT DO NOTHING`, 
+				userID, questionID)
 
 			var explanation string
 			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
@@ -229,7 +240,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			status := dataParts[1]
 			questionID := dataParts[2]
 			category := dataParts[3]
-			userID := update.CallbackQuery.Message.Chat.ID
 
 			var explanation string
 			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
@@ -263,7 +273,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			})
 			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 			
-		// EVENT 4: User clicked "Try Again" (Uses retryans prefix so score isn't duplicated)
+		// EVENT 4: User clicked "Try Again"
 		} else if dataParts[0] == "retry" && len(dataParts) == 3 {
 			questionID := dataParts[1]
 			category := dataParts[2]
@@ -316,7 +326,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			payload := map[string]interface{}{
-				"chat_id":    update.CallbackQuery.Message.Chat.ID,
+				"chat_id":    userID,
 				"text":       responseText,
 				"parse_mode": "Markdown",
 			}
@@ -335,9 +345,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// EVENT 6: User clicked "Reset Module"
 		} else if dataParts[0] == "reset" && len(dataParts) == 2 {
 			categoryToReset := dataParts[1]
-			userID := update.CallbackQuery.Message.Chat.ID
 
+			// 1. Reset points and attempts
 			db.Exec("UPDATE user_progress SET points = 0, attempts = 0 WHERE telegram_user_id = $1 AND category = $2", userID, categoryToReset)
+			
+			// 2. NEW LOGIC: Delete all answered question records for this user in this specific module so they can start fresh
+			db.Exec(`
+				DELETE FROM answered_questions 
+				WHERE telegram_user_id = $1 
+				AND question_id IN (SELECT id FROM questions WHERE category = $2)`, userID, categoryToReset)
 
 			// Confirm reset and show progress again
 			update.Message = update.CallbackQuery.Message
