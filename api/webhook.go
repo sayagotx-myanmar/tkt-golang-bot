@@ -369,7 +369,14 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		var replyMarkup interface{} = nil
 
 		if update.Message.Text == "/start" {
-			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nType /test to start practicing.\nType /progress to check your scores."
+			responseText = "Welcome to the TKT Prep Bot! 🚀\n\nClick the button below to begin, or use /progress anytime to check your scores."
+			
+			// This adds your custom branded button right under the welcome message
+			replyMarkup = InlineKeyboardMarkup{
+				InlineKeyboard: [][]InlineKeyboardButton{
+					{{Text: "Start Practicing with TKT Practice By Saya August", CallbackData: "cmd:categories"}},
+				},
+			}
 		} else if update.Message.Text == "/test" {
 			
 			rows, err := db.Query("SELECT DISTINCT category FROM questions WHERE category IS NOT NULL AND category != ''")
