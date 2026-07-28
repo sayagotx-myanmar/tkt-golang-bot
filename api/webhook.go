@@ -247,7 +247,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			var nextKeyboard InlineKeyboardMarkup
 
 			if status == "correct" {
-				responseText = "✅ *Correct!*\n\n*Explanation:*\n" + explanation
+				responseText = "✅ *Correct!*\n\n*💡 Hint:*\n" + explanation
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
@@ -255,7 +255,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					},
 				}
 			} else {
-				responseText = "❌ *Incorrect!*\n\n*Explanation:*\n" + explanation
+				responseText = "❌ *Incorrect!*\n\n*💡 Hint:*\n" + explanation
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
@@ -293,7 +293,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					},
 				}
 			} else {
-				responseText = "❌ *Incorrect!*\n\n*Explanation:*\n" + explanation
+				responseText = "❌ *Incorrect!*\n\n*💡 Hint:*\n" + explanation
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
