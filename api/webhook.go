@@ -106,7 +106,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// SCENARIO A: THE USER CLICKED A BUTTON
 	// ==========================================
 	if update.CallbackQuery != nil {
-		// Tell Telegram we received the click (stops the loading animation)
 		http.Post(apiURL+"answerCallbackQuery", "application/json", bytes.NewBuffer([]byte(fmt.Sprintf(`{"callback_query_id": "%s"}`, update.CallbackQuery.ID))))
 
 		dataParts := strings.Split(update.CallbackQuery.Data, ":")
@@ -129,17 +128,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				responseText = "No questions found for this category yet!"
 			} else {
-				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s", category, q.QuestionText)
-
 				type Option struct {
-					Text string
-					Data string
+					Text   string
+					Status string
 				}
 				
 				options := []Option{
-					{Text: q.CorrectOption, Data: fmt.Sprintf("ans:correct:%d:%s", q.ID, category)},
-					{Text: q.WrongOption1, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
-					{Text: q.WrongOption2, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
+					{Text: q.CorrectOption, Status: "correct"},
+					{Text: q.WrongOption1, Status: "wrong"},
+					{Text: q.WrongOption2, Status: "wrong"},
 				}
 
 				randSource := rand.NewSource(time.Now().UnixNano())
@@ -148,9 +145,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					options[i], options[j] = options[j], options[i]
 				})
 
-				var keyboard [][]InlineKeyboardButton
-				for _, opt := range options {
-					keyboard = append(keyboard, []InlineKeyboardButton{{Text: opt.Text, CallbackData: opt.Data}})
+				// Format the question and options into the message body
+				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
+					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
+
+				// Create the A, B, C inline buttons in a single row
+				keyboard := [][]InlineKeyboardButton{
+					{
+						{Text: "A", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[0].Status, q.ID, category)},
+						{Text: "B", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[1].Status, q.ID, category)},
+						{Text: "C", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[2].Status, q.ID, category)},
+					},
 				}
 				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 			}
@@ -227,17 +232,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					},
 				}
 			} else {
-				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s", category, q.QuestionText)
-
 				type Option struct {
-					Text string
-					Data string
+					Text   string
+					Status string
 				}
 				
 				options := []Option{
-					{Text: q.CorrectOption, Data: fmt.Sprintf("ans:correct:%d:%s", q.ID, category)},
-					{Text: q.WrongOption1, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
-					{Text: q.WrongOption2, Data: fmt.Sprintf("ans:wrong:%d:%s", q.ID, category)},
+					{Text: q.CorrectOption, Status: "correct"},
+					{Text: q.WrongOption1, Status: "wrong"},
+					{Text: q.WrongOption2, Status: "wrong"},
 				}
 
 				randSource := rand.NewSource(time.Now().UnixNano())
@@ -246,9 +249,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					options[i], options[j] = options[j], options[i]
 				})
 
-				var keyboard [][]InlineKeyboardButton
-				for _, opt := range options {
-					keyboard = append(keyboard, []InlineKeyboardButton{{Text: opt.Text, CallbackData: opt.Data}})
+				// Format the question and options into the message body for the retry as well
+				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
+					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
+
+				// Create the A, B, C inline buttons in a single row
+				keyboard := [][]InlineKeyboardButton{
+					{
+						{Text: "A", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[0].Status, q.ID, category)},
+						{Text: "B", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[1].Status, q.ID, category)},
+						{Text: "C", CallbackData: fmt.Sprintf("ans:%s:%d:%s", options[2].Status, q.ID, category)},
+					},
 				}
 				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 			}
