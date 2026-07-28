@@ -34,9 +34,10 @@ type Update struct {
 }
 
 type Message struct {
-	Chat    *Chat    `json:"chat"`
-	Text    string   `json:"text"`
-	Contact *Contact `json:"contact"` // Added for phone number sharing
+	MessageID int      `json:"message_id"` // Added for editing messages
+	Chat      *Chat    `json:"chat"`
+	Text      string   `json:"text"`
+	Contact   *Contact `json:"contact"`
 }
 
 type Chat struct {
@@ -63,7 +64,6 @@ type InlineKeyboardMarkup struct {
 	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
 }
 
-// Added structs for requesting contact info natively via Telegram
 type ReplyKeyboardMarkup struct {
 	Keyboard        [][]KeyboardButton `json:"keyboard"`
 	ResizeKeyboard  bool               `json:"resize_keyboard"`
@@ -80,7 +80,7 @@ type ReplyKeyboardRemove struct {
 }
 
 // ==========================================
-// 2. DATABASE CONNECTION LOGIC
+// 2. DATABASE & HELPER LOGIC
 // ==========================================
 
 var db *sql.DB
@@ -103,11 +103,26 @@ func initDB() {
 	}
 }
 
-// Helper function to check if a user is authorized
 func checkAuth(userID int64) bool {
 	var id int
 	err := db.QueryRow("SELECT id FROM authorized_users WHERE telegram_user_id = $1", userID).Scan(&id)
 	return err == nil
+}
+
+// DRY Helper to send requests to Telegram API
+func sendTelegramRequest(apiURL, endpoint string, payload interface{}) {
+	body, _ := json.Marshal(payload)
+	http.Post(apiURL+endpoint, "application/json", bytes.NewBuffer(body))
+}
+
+// Persistent Main Menu Keyboard
+func getMainMenu() ReplyKeyboardMarkup {
+	return ReplyKeyboardMarkup{
+		Keyboard: [][]KeyboardButton{
+			{{Text: "📚 Practice Modules"}, {Text: "📊 My Progress"}},
+		},
+		ResizeKeyboard: true,
+	}
 }
 
 // ==========================================
@@ -135,41 +150,43 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// SCENARIO A: THE USER CLICKED AN INLINE BUTTON
 	// ==========================================
 	if update.CallbackQuery != nil {
-		http.Post(apiURL+"answerCallbackQuery", "application/json", bytes.NewBuffer([]byte(fmt.Sprintf(`{"callback_query_id": "%s"}`, update.CallbackQuery.ID))))
+		// Acknowledge the click immediately so the loading spinner stops
+		sendTelegramRequest(apiURL, "answerCallbackQuery", map[string]string{
+			"callback_query_id": update.CallbackQuery.ID,
+		})
 
 		userID := update.CallbackQuery.Message.Chat.ID
+		messageID := update.CallbackQuery.Message.MessageID // Needed for editing the message
+		dataParts := strings.Split(update.CallbackQuery.Data, ":")
 
-		// SECURITY CHECK: Block unauthorized users from clicking buttons
+		// SECURITY CHECK
 		if !checkAuth(userID) {
-			replyBody, _ := json.Marshal(map[string]interface{}{
+			sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
 				"chat_id": userID,
 				"text":    "❌ You must be authorized to use this bot. Type /start to verify your account.",
 			})
-			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		dataParts := strings.Split(update.CallbackQuery.Data, ":")
-		
-		// EVENT 1: User chose a category (or clicked "Next Question")
+		// EVENT 1: User chose a category OR clicked "Next Question"
 		if dataParts[0] == "cat" && len(dataParts) == 2 {
 			category := dataParts[1]
-			
+
 			var q TKTQuestion
 			err := db.QueryRow(`
-				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
-				FROM questions 
-				WHERE category = $1 
-				AND id NOT IN (SELECT question_id FROM answered_questions WHERE telegram_user_id = $2)
-				ORDER BY RANDOM() 
-				LIMIT 1`, category, userID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+                SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
+                FROM questions 
+                WHERE category = $1 
+                AND id NOT IN (SELECT question_id FROM answered_questions WHERE telegram_user_id = $2)
+                ORDER BY RANDOM() 
+                LIMIT 1`, category, userID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
 
 			var responseText string
 			var replyMarkup interface{} = nil
 
 			if err == sql.ErrNoRows {
-				responseText = fmt.Sprintf("🎉 *Congratulations!*\n\nYou have completed all the practice questions for *%s*.\n\nType /progress to see your final score, or reset the module to try again.", category)
+				responseText = fmt.Sprintf("🎉 *Congratulations!*\n\nYou have completed all the practice questions for *%s*.\n\nCheck your progress from the main menu.", category)
 			} else if err != nil {
 				responseText = "Error fetching question. Please try again."
 			} else {
@@ -177,7 +194,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					Text   string
 					Status string
 				}
-				
+
 				options := []Option{
 					{Text: q.CorrectOption, Status: "correct"},
 					{Text: q.WrongOption1, Status: "wrong"},
@@ -190,7 +207,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					options[i], options[j] = options[j], options[i]
 				})
 
-				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
+				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s",
 					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
 
 				keyboard := [][]InlineKeyboardButton{
@@ -203,17 +220,17 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 			}
 
+			// Edit the current message instead of sending a new one
 			payload := map[string]interface{}{
 				"chat_id":    userID,
+				"message_id": messageID,
 				"text":       responseText,
 				"parse_mode": "Markdown",
 			}
 			if replyMarkup != nil {
 				payload["reply_markup"] = replyMarkup
 			}
-			
-			replyBody, _ := json.Marshal(payload)
-			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+			sendTelegramRequest(apiURL, "editMessageText", payload)
 
 		// EVENT 2: User clicked a FIRST-TRY answer
 		} else if dataParts[0] == "ans" && len(dataParts) == 4 {
@@ -226,51 +243,51 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				pointsToAdd = 1
 			}
 			db.Exec(`
-				INSERT INTO user_progress (telegram_user_id, category, points, attempts)
-				VALUES ($1, $2, $3, 1)
-				ON CONFLICT (telegram_user_id, category) 
-				DO UPDATE SET 
-					points = user_progress.points + EXCLUDED.points,
-					attempts = user_progress.attempts + EXCLUDED.attempts`,
+                INSERT INTO user_progress (telegram_user_id, category, points, attempts)
+                VALUES ($1, $2, $3, 1)
+                ON CONFLICT (telegram_user_id, category) 
+                DO UPDATE SET 
+                    points = user_progress.points + EXCLUDED.points,
+                    attempts = user_progress.attempts + EXCLUDED.attempts`,
 				userID, category, pointsToAdd)
 
 			db.Exec(`
-				INSERT INTO answered_questions (telegram_user_id, question_id) 
-				VALUES ($1, $2) 
-				ON CONFLICT DO NOTHING`, 
+                INSERT INTO answered_questions (telegram_user_id, question_id) 
+                VALUES ($1, $2) 
+                ON CONFLICT DO NOTHING`,
 				userID, questionID)
 
-			var explanation string
-			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
+			var explanation, qText string
+			db.QueryRow("SELECT question_text, explanation FROM questions WHERE id = $1", questionID).Scan(&qText, &explanation)
 
 			var responseText string
 			var nextKeyboard InlineKeyboardMarkup
 
 			if status == "correct" {
-				responseText = "✅ *Correct!*\n\n*💡 Hint:*\n" + explanation
+				responseText = fmt.Sprintf("✅ *Correct!*\n\n_%s_\n\n*💡 Explanation:*\n%s", qText, explanation)
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
-						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
 					},
 				}
 			} else {
-				responseText = "❌ *Incorrect!*\n\n*💡 Hint:*\n" + explanation
+				responseText = fmt.Sprintf("❌ *Incorrect!*\n\n_%s_\n\n*💡 Hint:*\n%s", qText, explanation)
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
-						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
+						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
 					},
 				}
 			}
 
-			replyBody, _ := json.Marshal(map[string]interface{}{
+			// Edit message to show feedback
+			sendTelegramRequest(apiURL, "editMessageText", map[string]interface{}{
 				"chat_id":      userID,
+				"message_id":   messageID,
 				"text":         responseText,
 				"parse_mode":   "Markdown",
 				"reply_markup": nextKeyboard,
 			})
-			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 
 		// EVENT 3: User clicked an answer AFTER hitting Try Again
 		} else if dataParts[0] == "retryans" && len(dataParts) == 4 {
@@ -278,38 +295,36 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			questionID := dataParts[2]
 			category := dataParts[3]
 
-			var explanation string
-			db.QueryRow("SELECT explanation FROM questions WHERE id = $1", questionID).Scan(&explanation)
+			var explanation, qText string
+			db.QueryRow("SELECT question_text, explanation FROM questions WHERE id = $1", questionID).Scan(&qText, &explanation)
 
 			var responseText string
 			var nextKeyboard InlineKeyboardMarkup
 
 			if status == "correct" {
-				responseText = "✅ *Correct!*\n\n*Explanation:*\n" + explanation
+				responseText = fmt.Sprintf("✅ *Correct!*\n\n_%s_\n\n*💡 Explanation:*\n%s", qText, explanation)
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
 						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
-						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
 					},
 				}
 			} else {
-				responseText = "❌ *Incorrect!*\n\n*💡 Hint:*\n" + explanation
+				responseText = fmt.Sprintf("❌ *Incorrect!*\n\n_%s_\n\n*💡 Hint:*\n%s", qText, explanation)
 				nextKeyboard = InlineKeyboardMarkup{
 					InlineKeyboard: [][]InlineKeyboardButton{
-						{{Text: "Try Again 🔄", CallbackData: fmt.Sprintf("retry:%s:%s", questionID, category)}},
-						{{Text: "Practice different module 🔄", CallbackData: "cmd:categories"}},
+						{{Text: "Next Question ➡️", CallbackData: fmt.Sprintf("cat:%s", category)}},
 					},
 				}
 			}
 
-			replyBody, _ := json.Marshal(map[string]interface{}{
+			sendTelegramRequest(apiURL, "editMessageText", map[string]interface{}{
 				"chat_id":      userID,
+				"message_id":   messageID,
 				"text":         responseText,
 				"parse_mode":   "Markdown",
 				"reply_markup": nextKeyboard,
 			})
-			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
-			
+
 		// EVENT 4: User clicked "Try Again"
 		} else if dataParts[0] == "retry" && len(dataParts) == 3 {
 			questionID := dataParts[1]
@@ -317,9 +332,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 			var q TKTQuestion
 			err := db.QueryRow(`
-				SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
-				FROM questions 
-				WHERE id = $1`, questionID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+                SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2 
+                FROM questions 
+                WHERE id = $1`, questionID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2)
 
 			var responseText string
 			var replyMarkup interface{} = nil
@@ -336,7 +351,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					Text   string
 					Status string
 				}
-				
+
 				options := []Option{
 					{Text: q.CorrectOption, Status: "correct"},
 					{Text: q.WrongOption1, Status: "wrong"},
@@ -349,7 +364,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					options[i], options[j] = options[j], options[i]
 				})
 
-				responseText = fmt.Sprintf("📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s", 
+				responseText = fmt.Sprintf("🔄 *Try Again!*\n\n📚 *Topic: %s*\n\n%s\n\n*A)* %s\n*B)* %s\n*C)* %s",
 					category, q.QuestionText, options[0].Text, options[1].Text, options[2].Text)
 
 				keyboard := [][]InlineKeyboardButton{
@@ -362,112 +377,84 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 			}
 
-			payload := map[string]interface{}{
-				"chat_id":    userID,
-				"text":       responseText,
-				"parse_mode": "Markdown",
-			}
-			if replyMarkup != nil {
-				payload["reply_markup"] = replyMarkup
-			}
-			
-			replyBody, _ := json.Marshal(payload)
-			http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+			sendTelegramRequest(apiURL, "editMessageText", map[string]interface{}{
+				"chat_id":      userID,
+				"message_id":   messageID,
+				"text":         responseText,
+				"parse_mode":   "Markdown",
+				"reply_markup": replyMarkup,
+			})
 
-		// EVENT 5: User clicked "Practice different module"
-		} else if dataParts[0] == "cmd" && dataParts[1] == "categories" {
-			update.Message = update.CallbackQuery.Message
-			update.Message.Text = "/test"
-
-		// EVENT 6: User clicked "Reset Module"
+		// EVENT 5: User clicked "Reset Module"
 		} else if dataParts[0] == "reset" && len(dataParts) == 2 {
 			categoryToReset := dataParts[1]
 
 			db.Exec("UPDATE user_progress SET points = 0, attempts = 0 WHERE telegram_user_id = $1 AND category = $2", userID, categoryToReset)
 			db.Exec(`
-				DELETE FROM answered_questions 
-				WHERE telegram_user_id = $1 
-				AND question_id IN (SELECT id FROM questions WHERE category = $2)`, userID, categoryToReset)
+                DELETE FROM answered_questions 
+                WHERE telegram_user_id = $1 
+                AND question_id IN (SELECT id FROM questions WHERE category = $2)`, userID, categoryToReset)
 
-			update.Message = update.CallbackQuery.Message
-			update.Message.Text = "/progress"
+			sendTelegramRequest(apiURL, "editMessageText", map[string]interface{}{
+				"chat_id":    userID,
+				"message_id": messageID,
+				"text":       fmt.Sprintf("🔄 *%s* has been reset. You can now practice it from the beginning.", categoryToReset),
+				"parse_mode": "Markdown",
+			})
 		}
-	} 
-	
+	}
+
 	// ==========================================
 	// SCENARIO B: THE USER TYPED A MESSAGE OR SHARED CONTACT
 	// ==========================================
 	if update.Message != nil {
 		userID := update.Message.Chat.ID
 		isAuth := checkAuth(userID)
+		text := update.Message.Text
 
-		// EVENT: User just pressed the "Share Contact" button
+		// EVENT: User shared their contact info
 		if update.Message.Contact != nil {
 			phone := update.Message.Contact.PhoneNumber
-			
-			// Format the phone number to match '9...' pattern
+
 			phone = strings.ReplaceAll(phone, "+", "")
 			phone = strings.TrimPrefix(phone, "95")
 			if strings.HasPrefix(phone, "09") {
 				phone = strings.TrimPrefix(phone, "0")
 			}
 
-			// Check if the formatted number exists in the database
 			var dbID int
 			err := db.QueryRow("SELECT id FROM authorized_users WHERE phone_number = $1", phone).Scan(&dbID)
 
 			if err == nil {
-				// SUCCESS: Update database to link this Telegram User ID
 				db.Exec("UPDATE authorized_users SET telegram_user_id = $1 WHERE phone_number = $2", userID, phone)
 
-				// 1. Send success message and remove the giant Contact button
-				replyBody, _ := json.Marshal(map[string]interface{}{
+				// Clear the contact button and show the new Persistent Menu
+				sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
 					"chat_id":      userID,
-					"text":         "✅ *Verification successful!*\n\nYour account has been securely linked to your phone number.",
+					"text":         "✅ *Verification successful!*\n\nWelcome to the TKT Prep Bot! Use the menu below to navigate.",
 					"parse_mode":   "Markdown",
-					"reply_markup": ReplyKeyboardRemove{RemoveKeyboard: true},
+					"reply_markup": getMainMenu(),
 				})
-				http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
-
-				// 2. Show the Welcome screen and Start Practice button
-				startBody, _ := json.Marshal(map[string]interface{}{
-					"chat_id":    userID,
-					"text":       "Welcome to the TKT Prep Bot! 🚀\n\nClick the button below to begin, or use /progress anytime to check your scores.",
-					"reply_markup": InlineKeyboardMarkup{
-						InlineKeyboard: [][]InlineKeyboardButton{
-							{{Text: "Start Practicing with TKT Practice By Saya August", CallbackData: "cmd:categories"}},
-						},
-					},
-				})
-				http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(startBody))
-
 			} else {
-				// FAILED: The number is not in the database
-				replyBody, _ := json.Marshal(map[string]interface{}{
+				sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
 					"chat_id":      userID,
 					"text":         "❌ Sorry, this phone number has not been granted access yet. Please contact the administrator after purchasing.",
 					"reply_markup": ReplyKeyboardRemove{RemoveKeyboard: true},
 				})
-				http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
 			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// EVENT: Standard text commands
+		// EVENT: Standard text commands or Menu Button clicks
 		var responseText string
 		var replyMarkup interface{} = nil
 
-		if update.Message.Text == "/start" {
+		if text == "/start" {
 			if isAuth {
-				responseText = "Welcome back to the TKT Prep Bot! 🚀\n\nClick the button below to begin, or use /progress anytime to check your scores."
-				replyMarkup = InlineKeyboardMarkup{
-					InlineKeyboard: [][]InlineKeyboardButton{
-						{{Text: "Start Practicing with TKT Practice By Saya August", CallbackData: "cmd:categories"}},
-					},
-				}
+				responseText = "Welcome back! 🚀\n\nUse the menu below to start practicing or check your scores."
+				replyMarkup = getMainMenu()
 			} else {
-				// User is NOT authorized. Ask for contact info.
 				responseText = "🔒 *Access Restricted*\n\nTo access the TKT Practice materials, you must verify your purchase.\n\nPlease tap the button below to share your phone number securely."
 				replyMarkup = ReplyKeyboardMarkup{
 					Keyboard: [][]KeyboardButton{
@@ -477,7 +464,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					OneTimeKeyboard: true,
 				}
 			}
-		} else if update.Message.Text == "/test" {
+		} else if text == "📚 Practice Modules" || text == "/test" {
 			if !isAuth {
 				responseText = "❌ You must be authorized to use this bot. Type /start to verify your account."
 			} else {
@@ -491,21 +478,21 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					for rows.Next() {
 						var cat string
 						if err := rows.Scan(&cat); err == nil {
-							keyboard = append(keyboard, []InlineKeyboardButton{{Text: cat, CallbackData: "cat:" + cat}})
+							keyboard = append(keyboard, []InlineKeyboardButton{{Text: "📘 " + cat, CallbackData: "cat:" + cat}})
 						}
 					}
 					if len(keyboard) > 0 {
 						replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 					} else {
-						responseText = "No categories found. Please add some in your Supabase table!"
+						responseText = "No modules found. Please add data to your Supabase table!"
 					}
 				}
 			}
-		} else if update.Message.Text == "/progress" {
+		} else if text == "📊 My Progress" || text == "/progress" {
 			if !isAuth {
 				responseText = "❌ You must be authorized to use this bot. Type /start to verify your account."
 			} else {
-				rows, err := db.Query("SELECT category, points, attempts FROM user_progress WHERE telegram_user_id = $1", userID)
+				rows, err := db.Query("SELECT category, points, attempts FROM user_progress WHERE telegram_user_id = $1 ORDER BY category", userID)
 				if err != nil {
 					responseText = "Error fetching your progress."
 				} else {
@@ -527,8 +514,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					if !hasData {
-						responseText = "📊 *Your Learning Progress:*\n\nYou haven't completed any practice questions yet! Type /test to begin."
+						responseText = "📊 *Your Learning Progress:*\n\nYou haven't completed any practice questions yet! Tap 'Practice Modules' to begin."
 					} else {
+						responseText += "\n_Need a fresh start? Use the buttons below to reset a module's progress._"
 						replyMarkup = InlineKeyboardMarkup{InlineKeyboard: keyboard}
 					}
 				}
@@ -537,7 +525,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			if !isAuth {
 				responseText = "❌ You must be authorized to use this bot. Type /start to verify your account."
 			} else {
-				responseText = "I received your message! Type /test to practice or /progress to see your scores."
+				responseText = "I didn't understand that command. Please use the menu below."
+				replyMarkup = getMainMenu()
 			}
 		}
 
@@ -550,8 +539,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			payload["reply_markup"] = replyMarkup
 		}
 
-		replyBody, _ := json.Marshal(payload)
-		http.Post(apiURL+"sendMessage", "application/json", bytes.NewBuffer(replyBody))
+		sendTelegramRequest(apiURL, "sendMessage", payload)
 	}
 
 	w.WriteHeader(http.StatusOK)
