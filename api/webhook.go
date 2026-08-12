@@ -115,7 +115,7 @@ func checkUserAccess(userID int64) (bool, string) {
 	var expiresAt time.Time
 
 	err := db.QueryRow("SELECT is_authorized, expires_at FROM users WHERE telegram_id = $1", userID).Scan(&isAuth, &expiresAt)
-	
+
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return false, "unregistered" // Special flag to prompt for phone number
@@ -145,7 +145,7 @@ func checkUserAccess(userID int64) (bool, string) {
 func sendTelegramRequest(endpoint string, payload interface{}) {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/%s", botToken, endpoint)
-	
+
 	body, _ := json.Marshal(payload)
 	http.Post(apiURL, "application/json", bytes.NewBuffer(body))
 }
@@ -259,6 +259,7 @@ func handleCallbackQuery(cb *CallbackQuery) {
 
 func handleMessage(msg *Message) {
 	userID := msg.Chat.ID
+	text := msg.Text
 
 	// EVENT: User shared their contact info
 	if msg.Contact != nil {
@@ -266,7 +267,20 @@ func handleMessage(msg *Message) {
 		return
 	}
 
-	text := msg.Text
+	// NEW: Intercept /redeem command BEFORE the gatekeeper blocks them
+	if strings.HasPrefix(text, "/redeem ") {
+		code := strings.TrimSpace(strings.TrimPrefix(text, "/redeem "))
+		if code == "" {
+			sendTelegramRequest("sendMessage", map[string]interface{}{
+				"chat_id":    userID,
+				"text":       "Please provide a code. Example: `/redeem TKT-AUG-1234`",
+				"parse_mode": "Markdown",
+			})
+			return
+		}
+		processRedemption(userID, code)
+		return
+	}
 
 	// Gatekeeper: Check status for normal text commands
 	isAllowed, denyMessage := checkUserAccess(userID)
@@ -348,12 +362,12 @@ func processContactShare(userID int64, phone string) {
 
 		// Create/Update the active user in the 'users' table to start their trial
 		db.Exec(`
-			INSERT INTO users (telegram_id, is_authorized, subscription_status, joined_at, expires_at) 
-			VALUES ($1, true, 'trial', NOW(), $2)
-			ON CONFLICT (telegram_id) DO UPDATE SET 
-				is_authorized = true, 
-				subscription_status = 'trial', 
-				expires_at = $2`, 
+            INSERT INTO users (telegram_id, is_authorized, subscription_status, joined_at, expires_at) 
+            VALUES ($1, true, 'trial', NOW(), $2)
+            ON CONFLICT (telegram_id) DO UPDATE SET 
+                is_authorized = true, 
+                subscription_status = 'trial', 
+                expires_at = $2`,
 			userID, expiresAt)
 
 		// Send success message and Main Menu
@@ -466,12 +480,12 @@ func showProgress(userID int64) {
 func sendQuestion(userID int64, messageID int, category string) {
 	var q TKTQuestion
 	err := db.QueryRow(`
-		SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
-		FROM questions 
-		WHERE category = $1 
-		AND id NOT IN (SELECT question_id FROM answered_questions WHERE telegram_user_id = $2)
-		ORDER BY RANDOM() 
-		LIMIT 1`, category, userID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
+        SELECT id, question_text, correct_option, wrong_option_1, wrong_option_2, explanation 
+        FROM questions 
+        WHERE category = $1 
+        AND id NOT IN (SELECT question_id FROM answered_questions WHERE telegram_user_id = $2)
+        ORDER BY RANDOM() 
+        LIMIT 1`, category, userID).Scan(&q.ID, &q.QuestionText, &q.CorrectOption, &q.WrongOption1, &q.WrongOption2, &q.Explanation)
 
 	if err == sql.ErrNoRows {
 		sendTelegramRequest("editMessageText", map[string]interface{}{
@@ -516,12 +530,12 @@ func handleAnswer(userID int64, messageID int, status, questionID, category stri
 			pointsToAdd = 1
 		}
 		db.Exec(`
-			INSERT INTO user_progress (telegram_user_id, category, points, attempts)
-			VALUES ($1, $2, $3, 1)
-			ON CONFLICT (telegram_user_id, category) 
-			DO UPDATE SET 
-				points = user_progress.points + EXCLUDED.points,
-				attempts = user_progress.attempts + EXCLUDED.attempts`, userID, category, pointsToAdd)
+            INSERT INTO user_progress (telegram_user_id, category, points, attempts)
+            VALUES ($1, $2, $3, 1)
+            ON CONFLICT (telegram_user_id, category) 
+            DO UPDATE SET 
+                points = user_progress.points + EXCLUDED.points,
+                attempts = user_progress.attempts + EXCLUDED.attempts`, userID, category, pointsToAdd)
 
 		db.Exec("INSERT INTO answered_questions (telegram_user_id, question_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", userID, questionID)
 	}
@@ -601,5 +615,57 @@ func resetCategory(userID int64, messageID int, category string) {
 		"message_id": messageID,
 		"text":       fmt.Sprintf("🔄 *%s* has been reset. You can now practice it from the beginning.", category),
 		"parse_mode": "Markdown",
+	})
+}
+
+// NEW: Redemption logic for activation codes
+func processRedemption(userID int64, code string) {
+	// 1. Check if the code exists and is NOT used
+	var codeID int
+	err := db.QueryRow("SELECT id FROM activation_codes WHERE code = $1 AND is_used = false", code).Scan(&codeID)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			sendTelegramRequest("sendMessage", map[string]interface{}{
+				"chat_id": userID,
+				"text":    "❌ Invalid or already used activation code. Please check your code and try again.",
+			})
+		} else {
+			sendTelegramRequest("sendMessage", map[string]interface{}{
+				"chat_id": userID,
+				"text":    "⚠️ A database error occurred. Please try again later.",
+			})
+		}
+		return
+	}
+
+	// 2. Mark the code as used and link it to the user who redeemed it
+	db.Exec("UPDATE activation_codes SET is_used = true, telegram_id = $1 WHERE id = $2", userID, codeID)
+
+	// 3. Extend the user's expiration date by 1 month
+	_, err = db.Exec(`
+		UPDATE users 
+		SET 
+			expires_at = GREATEST(NOW(), expires_at) + INTERVAL '1 month',
+			is_authorized = true,
+			subscription_status = 'active'
+		WHERE telegram_id = $1
+	`, userID)
+
+	if err != nil {
+		log.Printf("Error updating expiration: %v", err)
+		return
+	}
+
+	// 4. Fetch the new expiration date to show the user
+	var newExpiry time.Time
+	db.QueryRow("SELECT expires_at FROM users WHERE telegram_id = $1", userID).Scan(&newExpiry)
+
+	// 5. Send a success message
+	sendTelegramRequest("sendMessage", map[string]interface{}{
+		"chat_id":      userID,
+		"text":         fmt.Sprintf("🎉 *Subscription Renewed!*\n\nYour code was accepted. Your access has been extended until *%s*.", newExpiry.Format("Jan 02, 2006")),
+		"parse_mode":   "Markdown",
+		"reply_markup": getMainMenu(),
 	})
 }
