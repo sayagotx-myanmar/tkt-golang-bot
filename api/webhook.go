@@ -37,7 +37,7 @@ type Message struct {
 	MessageID int      `json:"message_id"` // Added for editing messages
 	Chat      *Chat    `json:"chat"`
 	Text      string   `json:"text"`
-	Contact   *Contact `json:"contact"`
+	Contact   *Contact `json:"contact"` // Added for phone number sharing
 }
 
 type Chat struct {
@@ -57,7 +57,8 @@ type CallbackQuery struct {
 
 type InlineKeyboardButton struct {
 	Text         string `json:"text"`
-	CallbackData string `json:"callback_data"`
+	CallbackData string `json:"callback_data,omitempty"` // Added omitempty
+	URL          string `json:"url,omitempty"`           // NEW: Added to support group links
 }
 
 type InlineKeyboardMarkup struct {
@@ -159,7 +160,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		messageID := update.CallbackQuery.Message.MessageID // Needed for editing the message
 		dataParts := strings.Split(update.CallbackQuery.Data, ":")
 
-		// SECURITY CHECK
+		// SECURITY CHECK: Block unauthorized users from clicking buttons
 		if !checkAuth(userID) {
 			sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
 				"chat_id": userID,
@@ -426,16 +427,36 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			err := db.QueryRow("SELECT id FROM authorized_users WHERE phone_number = $1", phone).Scan(&dbID)
 
 			if err == nil {
+				// SUCCESS: Update database to link this Telegram User ID
 				db.Exec("UPDATE authorized_users SET telegram_user_id = $1 WHERE phone_number = $2", userID, phone)
 
-				// Clear the contact button and show the new Persistent Menu
+				// 1. Send success message and load the persistent Main Menu
 				sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
 					"chat_id":      userID,
-					"text":         "✅ *Verification successful!*\n\nWelcome to the TKT Prep Bot! Use the menu below to navigate.",
+					"text":         "✅ *Verification successful!*\n\nYour account has been securely linked to your phone number.",
 					"parse_mode":   "Markdown",
 					"reply_markup": getMainMenu(),
 				})
+
+				// 2. NEW LOGIC: Send the Discussion Group Invite
+				groupKeyboard := InlineKeyboardMarkup{
+					InlineKeyboard: [][]InlineKeyboardButton{
+						{{
+							Text: "💬 Join Discussion Group", 
+							URL:  "https://t.me/+gdgq6rlcuS43OTA1", // <-- REPLACE THIS LINK WITH YOUR ACTUAL GROUP LINK!
+						}},
+					},
+				}
+				
+				sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
+					"chat_id":      userID,
+					"text":         "🎉 *Welcome to the TKT Prep Community!*\n\nPlease join our exclusive Telegram group to discuss questions, share insights, and connect with other teachers.",
+					"parse_mode":   "Markdown",
+					"reply_markup": groupKeyboard,
+				})
+
 			} else {
+				// FAILED: The number is not in the database
 				sendTelegramRequest(apiURL, "sendMessage", map[string]interface{}{
 					"chat_id":      userID,
 					"text":         "❌ Sorry, this phone number has not been granted access yet. Please contact the administrator after purchasing.",
