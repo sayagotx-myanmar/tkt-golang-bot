@@ -144,6 +144,15 @@ func checkUserAccess(userID int64) (bool, string) {
     return true, "" 
 }
 
+func getOnboardingStep(userID int64) int {
+    var step int
+    err := db.QueryRow("SELECT onboarding_step FROM users WHERE telegram_id = $1", userID).Scan(&step)
+    if err != nil {
+        return 0 
+    }
+    return step
+}
+
 // ==========================================
 // 4. TELEGRAM API HELPERS
 // ==========================================
@@ -256,6 +265,33 @@ func handleCallbackQuery(cb *CallbackQuery) {
         if len(dataParts) == 2 {
             resetCategory(userID, messageID, dataParts[1])
         }
+    case "onboard":
+        if len(dataParts) >= 3 {
+            field := dataParts[1]
+            value := strings.Join(dataParts[2:], ":") // In case values have colons
+
+            if field == "age" {
+                db.Exec("UPDATE users SET age_group = $1, onboarding_step = 3 WHERE telegram_id = $2", value, userID)
+                sendTelegramRequest("deleteMessage", map[string]interface{}{"chat_id": userID, "message_id": messageID})
+                sendExperienceKeyboard(userID)
+            } else if field == "exp" {
+                db.Exec("UPDATE users SET teaching_experience = $1, onboarding_step = 4 WHERE telegram_id = $2", value, userID)
+                sendTelegramRequest("deleteMessage", map[string]interface{}{"chat_id": userID, "message_id": messageID})
+                sendTelegramRequest("sendMessage", map[string]interface{}{
+                    "chat_id":    userID,
+                    "text":       "*4. What school or organization are you currently working for?*\n_(Type 'Freelance' or 'None' if not applicable)_",
+                    "parse_mode": "Markdown",
+                })
+            } else if field == "level" {
+                db.Exec("UPDATE users SET teaching_levels = $1, onboarding_step = 6 WHERE telegram_id = $2", value, userID)
+                sendTelegramRequest("deleteMessage", map[string]interface{}{"chat_id": userID, "message_id": messageID})
+                sendTelegramRequest("sendMessage", map[string]interface{}{
+                    "chat_id":    userID,
+                    "text":       "*6. Which city or town do you currently live in?*",
+                    "parse_mode": "Markdown",
+                })
+            }
+        }
     }
 }
 
@@ -287,6 +323,38 @@ func handleMessage(msg *Message) {
     }
 
     isAllowed, denyMessage := checkUserAccess(userID)
+
+    // --- NEW ONBOARDING TEXT INTERCEPT ---
+    step := getOnboardingStep(userID)
+    if step > 0 && step < 7 {
+        if text == "/start" || text == "/test" || text == "/progress" {
+            // Force them to finish answering the current question
+            sendTelegramRequest("sendMessage", map[string]interface{}{
+                "chat_id": userID,
+                "text":    "Please answer the current question to complete your setup.",
+            })
+            return
+        }
+
+        switch step {
+        case 1: // Name
+            db.Exec("UPDATE users SET full_name = $1, onboarding_step = 2 WHERE telegram_id = $2", text, userID)
+            sendAgeKeyboard(userID)
+        case 4: // School/Organization
+            db.Exec("UPDATE users SET school_org = $1, onboarding_step = 5 WHERE telegram_id = $2", text, userID)
+            sendLevelKeyboard(userID)
+        case 6: // City/Town
+            db.Exec("UPDATE users SET city = $1, onboarding_step = 7 WHERE telegram_id = $2", text, userID)
+            finishOnboarding(userID)
+        default:
+            sendTelegramRequest("sendMessage", map[string]interface{}{
+                "chat_id": userID,
+                "text":    "Please use the buttons provided above to answer this question.",
+            })
+        }
+        return
+    }
+    // --- END NEW ONBOARDING INTERCEPT ---
 
     if text == "/start" {
         if isAllowed {
@@ -415,36 +483,23 @@ func processContactShare(userID int64, phone string) {
         }
         expiresAt := time.Now().AddDate(0, trialMonths, 0)
 
+        // START ONBOARDING INSTEAD OF SENDING TO MENU
         db.Exec(`
-            INSERT INTO users (telegram_id, is_authorized, subscription_status, joined_at, expires_at) 
-            VALUES ($1, true, 'trial', NOW(), $2)
+            INSERT INTO users (telegram_id, is_authorized, subscription_status, joined_at, expires_at, onboarding_step) 
+            VALUES ($1, true, 'trial', NOW(), $2, 1)
             ON CONFLICT (telegram_id) DO UPDATE SET 
                 is_authorized = true, 
                 subscription_status = 'trial', 
-                expires_at = $2`,
+                expires_at = $2,
+                onboarding_step = 1`,
             userID, expiresAt)
 
+        // Remove the old keyboard so they can type their name
         sendTelegramRequest("sendMessage", map[string]interface{}{
             "chat_id":      userID,
-            "text":         fmt.Sprintf("✅ *Verification successful!*\n\nYour account has been linked. Your trial is active until *%s*.", expiresAt.Format("Jan 02, 2006")),
+            "text":         "✅ *Phone verified!*\n\nBefore we start, let's set up your profile. This helps me tailor the experience for you.\n\n*1. What is your full name?*",
             "parse_mode":   "Markdown",
-            "reply_markup": getMainMenu(),
-        })
-
-        groupKeyboard := InlineKeyboardMarkup{
-            InlineKeyboard: [][]InlineKeyboardButton{
-                {{
-                    Text: "💬 Join Discussion Group",
-                    URL:  "https://t.me/+gdgq6rlcuS43OTA1",
-                }},
-            },
-        }
-
-        sendTelegramRequest("sendMessage", map[string]interface{}{
-            "chat_id":      userID,
-            "text":         "🎉 *Welcome to the TKT Prep Community!*\n\nPlease join our exclusive Telegram group to discuss questions, share insights, and connect with other teachers.",
-            "parse_mode":   "Markdown",
-            "reply_markup": groupKeyboard,
+            "reply_markup": ReplyKeyboardRemove{RemoveKeyboard: true},
         })
 
     } else {
@@ -712,6 +767,84 @@ func processRedemption(userID int64, code string) {
         "chat_id":      userID,
         "text":         fmt.Sprintf("🎉 *Subscription Renewed!*\n\nYour code was accepted. Your access has been extended until *%s*.", newExpiry.Format("Jan 02, 2006")),
         "parse_mode":   "Markdown",
+        "reply_markup": getMainMenu(),
+    })
+}
+
+// ==========================================
+// 10. ONBOARDING HELPER FUNCTIONS
+// ==========================================
+
+func sendAgeKeyboard(userID int64) {
+    keyboard := InlineKeyboardMarkup{
+        InlineKeyboard: [][]InlineKeyboardButton{
+            {{Text: "20-25", CallbackData: "onboard:age:20-25"}, {Text: "26-30", CallbackData: "onboard:age:26-30"}},
+            {{Text: "31-40", CallbackData: "onboard:age:31-40"}, {Text: "40+", CallbackData: "onboard:age:40+"}},
+        },
+    }
+    sendTelegramRequest("sendMessage", map[string]interface{}{
+        "chat_id":      userID,
+        "text":         "*2. What is your age group?*",
+        "parse_mode":   "Markdown",
+        "reply_markup": keyboard,
+    })
+}
+
+func sendExperienceKeyboard(userID int64) {
+    keyboard := InlineKeyboardMarkup{
+        InlineKeyboard: [][]InlineKeyboardButton{
+            {{Text: "0-2 Years", CallbackData: "onboard:exp:0-2 Yrs"}},
+            {{Text: "3-5 Years", CallbackData: "onboard:exp:3-5 Yrs"}},
+            {{Text: "5+ Years", CallbackData: "onboard:exp:5+ Yrs"}},
+        },
+    }
+    sendTelegramRequest("sendMessage", map[string]interface{}{
+        "chat_id":      userID,
+        "text":         "*3. How many years of teaching experience do you have?*",
+        "parse_mode":   "Markdown",
+        "reply_markup": keyboard,
+    })
+}
+
+func sendLevelKeyboard(userID int64) {
+    keyboard := InlineKeyboardMarkup{
+        InlineKeyboard: [][]InlineKeyboardButton{
+            {{Text: "Young Learners", CallbackData: "onboard:level:Young Learners"}},
+            {{Text: "Teens", CallbackData: "onboard:level:Teens"}},
+            {{Text: "Adults", CallbackData: "onboard:level:Adults"}},
+        },
+    }
+    sendTelegramRequest("sendMessage", map[string]interface{}{
+        "chat_id":      userID,
+        "text":         "*5. What age/level do you primarily teach?*",
+        "parse_mode":   "Markdown",
+        "reply_markup": keyboard,
+    })
+}
+
+func finishOnboarding(userID int64) {
+    // Send the Discussion Group Invite
+    groupKeyboard := InlineKeyboardMarkup{
+        InlineKeyboard: [][]InlineKeyboardButton{
+            {{
+                Text: "💬 Join Discussion Group",
+                URL:  "https://t.me/+gdgq6rlcuS43OTA1", // Replace with your real link if changed
+            }},
+        },
+    }
+
+    // Send the Welcome message with the group link
+    sendTelegramRequest("sendMessage", map[string]interface{}{
+        "chat_id":      userID,
+        "text":         "🎉 *Profile Complete! Welcome to the TKT Prep Community!*\n\nPlease join our exclusive Telegram group to discuss questions, share insights, and connect with other teachers.",
+        "parse_mode":   "Markdown",
+        "reply_markup": groupKeyboard,
+    })
+
+    // Finally, send the Main Menu so they can start practicing
+    sendTelegramRequest("sendMessage", map[string]interface{}{
+        "chat_id":      userID,
+        "text":         "You are all set! Use the menu below to start practicing.",
         "reply_markup": getMainMenu(),
     })
 }
